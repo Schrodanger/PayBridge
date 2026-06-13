@@ -1,0 +1,161 @@
+# PayBridge — full local stack.
+#
+# Bring up:    docker compose up --build -d
+# Tear down:   docker compose down -v
+#
+# Endpoints once running:
+#   Payment API ........ http://localhost:8080  (Swagger at /swagger)
+#   Provider Stub ...... http://localhost:8082
+#   RabbitMQ UI ........ http://localhost:15672  (paybridge / paybridge)
+#   Aspire Dashboard ... http://localhost:18888  (traces + metrics + logs)
+#   Postgres ........... localhost:5432  (paybridge / paybridge / paybridge)
+#   Redis .............. localhost:6379
+
+name: paybridge
+
+x-otel-env: &otel-env
+  Otel__Endpoint: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+
+services:
+  # -------- Infrastructure --------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: paybridge
+      POSTGRES_PASSWORD: paybridge
+      POSTGRES_DB: paybridge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paybridge -d paybridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: paybridge
+      RABBITMQ_DEFAULT_PASS: paybridge
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # -------- Observability --------
+  aspire-dashboard:
+    # Single-container UI for traces/metrics/logs over OTLP.
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:8.0
+    environment:
+      DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+      # UI on 18888, OTLP receiver on 18889. The dashboard's option parser doesn't accept "+"
+      # in the URL, so bind to 0.0.0.0 explicitly.
+      ASPNETCORE_URLS: http://0.0.0.0:18888
+      DOTNET_DASHBOARD_OTLP_ENDPOINT_URL: http://0.0.0.0:18889
+    ports:
+      - "18888:18888"
+      - "18889:18889"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health
+    depends_on:
+      - aspire-dashboard
+
+  # -------- Application --------
+  fraud-service:
+    build:
+      context: .
+      dockerfile: src/PayBridge.FraudService/Dockerfile
+    environment:
+      <<: *otel-env
+      PORT: 8080
+    ports:
+      - "8081:8080"
+    depends_on:
+      - otel-collector
+
+  provider-stub:
+    build:
+      context: .
+      dockerfile: src/PayBridge.ProviderStub/Dockerfile
+    environment:
+      <<: *otel-env
+      PaymentApi__Url: http://payment-api:8080
+    ports:
+      - "8082:8080"
+    depends_on:
+      - otel-collector
+      - payment-api
+
+  payment-api:
+    build:
+      context: .
+      dockerfile: src/PayBridge.PaymentApi/Dockerfile
+    environment:
+      <<: *otel-env
+      ASPNETCORE_ENVIRONMENT: Development   # exposes /swagger for the reviewer
+      ConnectionStrings__Postgres: Host=postgres;Database=paybridge;Username=paybridge;Password=paybridge
+      ConnectionStrings__Redis: redis:6379
+      FraudService__Url: http://fraud-service:8080
+      ProviderService__Url: http://provider-stub:8080
+      RabbitMq__Host: rabbitmq
+      RabbitMq__User: paybridge
+      RabbitMq__Pass: paybridge
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      fraud-service:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+  settlement-consumer:
+    build:
+      context: .
+      dockerfile: src/PayBridge.SettlementConsumer/Dockerfile
+    environment:
+      <<: *otel-env
+      ConnectionStrings__Postgres: Host=postgres;Database=paybridge;Username=paybridge;Password=paybridge
+      RabbitMq__Host: rabbitmq
+      RabbitMq__User: paybridge
+      RabbitMq__Pass: paybridge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+volumes:
+  postgres-data:
